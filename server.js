@@ -1,154 +1,164 @@
 const express = require('express');
-const fs = require('fs');
-const path = require('path');
 const fetch = require('node-fetch');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
-const PROFILES_FILE = path.join(__dirname, 'profiles.json');
+
+// ─────────────────────────────────────────────────────────────
+// CORS — allow any website to call this API
+// ─────────────────────────────────────────────────────────────
+app.use((req, res, next) => {
+    res.header('Access-Control-Allow-Origin', '*');
+    res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+    res.header('Access-Control-Allow-Headers', 'Content-Type');
+    if (req.method === 'OPTIONS') return res.sendStatus(200);
+    next();
+});
 
 app.use(express.json());
-app.use(express.static(path.join(__dirname, 'public')));
 
-// ---------- JSON STORAGE ----------
-function loadProfiles() {
-    try {
-        if (!fs.existsSync(PROFILES_FILE)) {
-            fs.writeFileSync(PROFILES_FILE, JSON.stringify({ profiles: {} }, null, 2));
+// ─────────────────────────────────────────────────────────────
+// HOME — simple info page
+// ─────────────────────────────────────────────────────────────
+app.get('/', (req, res) => {
+    res.json({
+        service: 'VCN Roblox Avatar Fetcher',
+        status: 'online',
+        endpoints: {
+            lookup: '/lookup?username=Roblox',
+            health: '/health',
+            user: '/user/:id'
         }
-        const raw = fs.readFileSync(PROFILES_FILE, 'utf-8');
-        const data = JSON.parse(raw);
-        if (!data.profiles) data.profiles = {};
-        return data;
-    } catch (err) {
-        console.error('[JSON] Load failed:', err.message);
-        return { profiles: {} };
-    }
-}
-
-function saveProfiles(data) {
-    try {
-        fs.writeFileSync(PROFILES_FILE, JSON.stringify(data, null, 2));
-    } catch (err) {
-        console.error('[JSON] Save failed:', err.message);
-    }
-}
-
-// ---------- ROBLOX API ----------
-async function fetchRobloxUser(username) {
-    const url = `https://users.roblox.com/v1/users/search?keyword=${encodeURIComponent(username)}&limit=10`;
-    const res = await fetch(url);
-    if (!res.ok) throw new Error(`Roblox user search failed (${res.status})`);
-    const data = await res.json();
-    if (!data.data || data.data.length === 0) throw new Error('User not found');
-    const exact = data.data.find(u => u.name.toLowerCase() === username.toLowerCase());
-    return exact || data.data[0];
-}
-
-async function fetchRobloxAvatar(userId) {
-    const url = `https://thumbnails.roblox.com/v1/users/avatar-headshot?userIds=${userId}&size=420x420&format=Png&isCircular=false`;
-    const res = await fetch(url);
-    if (!res.ok) throw new Error(`Avatar fetch failed (${res.status})`);
-    const data = await res.json();
-    return data.data?.[0]?.imageUrl || '';
-}
-
-async function fetchRobloxProfile(userId) {
-    const url = `https://users.roblox.com/v1/users/${userId}`;
-    const res = await fetch(url);
-    if (!res.ok) throw new Error(`Profile fetch failed (${res.status})`);
-    return res.json();
-}
-
-// ---------- ROUTES ----------
-app.get('/api/profiles', (req, res) => {
-    const data = loadProfiles();
-    res.json(data.profiles);
+    });
 });
 
-app.get('/api/profiles/:username', (req, res) => {
-    const { username } = req.params;
-    const data = loadProfiles();
-    const profile = data.profiles[username.toLowerCase()];
-    if (!profile) return res.status(404).json({ error: 'Profile not cached' });
-    res.json(profile);
+// ─────────────────────────────────────────────────────────────
+// HEALTH — quick alive check
+// ─────────────────────────────────────────────────────────────
+app.get('/health', (req, res) => {
+    res.json({
+        status: 'ok',
+        time: new Date().toISOString(),
+        uptime: process.uptime()
+    });
 });
 
-app.post('/api/lookup', async (req, res) => {
-    const { username } = req.body;
-    if (!username || typeof username !== 'string' || !username.trim()) {
-        return res.status(400).json({ error: 'Username required' });
+// ─────────────────────────────────────────────────────────────
+// LOOKUP — search a Roblox user by username
+// GET /lookup?username=Roblox
+// ─────────────────────────────────────────────────────────────
+app.get('/lookup', async (req, res) => {
+    const username = (req.query.username || '').trim();
+    if (!username) {
+        return res.status(400).json({ error: 'username query parameter required' });
     }
-    const key = username.trim().toLowerCase();
-    const data = loadProfiles();
 
     try {
-        const user = await fetchRobloxUser(username.trim());
-        const [avatarUrl, profile] = await Promise.all([
-            fetchRobloxAvatar(user.id),
-            fetchRobloxProfile(user.id)
-        ]);
+        console.log(`[lookup] Searching for: ${username}`);
 
-        const existing = data.profiles[key] || {};
-        const cached = {
-            username: profile.name,
-            userId: profile.id,
-            displayName: profile.displayName || profile.name,
-            avatarUrl,
-            description: profile.description || '',
-            created: profile.created || '',
-            fetchedAt: new Date().toISOString(),
-            ransomDebt: existing.ransomDebt ?? 1000,
-            weeksOverdue: existing.weeksOverdue ?? 0,
-            kills: existing.kills ?? Math.floor(Math.random() * 200),
-            status: existing.status ?? 'Newly Flagged'
+        // 1. Search Roblox for the user
+        const searchRes = await fetch(
+            `https://users.roblox.com/v1/users/search?keyword=${encodeURIComponent(username)}&limit=10`
+        );
+        if (!searchRes.ok) {
+            console.error(`[lookup] Roblox search failed: ${searchRes.status}`);
+            return res.status(502).json({ error: `Roblox search failed (${searchRes.status})` });
+        }
+        const searchData = await searchRes.json();
+
+        if (!searchData.data || searchData.data.length === 0) {
+            return res.status(404).json({ error: 'User not found on Roblox' });
+        }
+
+        // Prefer exact case-insensitive match
+        const exact = searchData.data.find(
+            u => u.name.toLowerCase() === username.toLowerCase()
+        );
+        const user = exact || searchData.data[0];
+        console.log(`[lookup] Found: ${user.name} (ID ${user.id})`);
+
+        // 2. Fetch avatar headshot from OFFICIAL Roblox thumbnail API
+        const thumbUrl = `https://thumbnails.roblox.com/v1/users/avatar-headshot?userIds=${user.id}&size=420x420&format=Png&isCircular=false`;
+        const thumbRes = await fetch(thumbUrl);
+        let avatarUrl = '';
+        if (thumbRes.ok) {
+            const thumbData = await thumbRes.json();
+            avatarUrl = thumbData?.data?.[0]?.imageUrl || '';
+        } else {
+            console.warn(`[lookup] Thumbnail fetch failed: ${thumbRes.status}`);
+        }
+
+        // 3. Fetch full profile
+        const profileRes = await fetch(`https://users.roblox.com/v1/users/${user.id}`);
+        const profileData = profileRes.ok ? await profileRes.json() : null;
+
+        // 4. Return combined data
+        const result = {
+            username: user.name,
+            userId: user.id,
+            displayName: (profileData && profileData.displayName) || user.displayName || user.name,
+            avatarUrl: avatarUrl,
+            description: (profileData && profileData.description) || '',
+            created: (profileData && profileData.created) || ''
         };
 
-        data.profiles[key] = cached;
-        saveProfiles(data);
-
-        console.log(`[LOOKUP] ${cached.username} (${cached.userId}) saved`);
-        res.json(cached);
+        console.log(`[lookup] Returning: ${result.username} (avatar: ${avatarUrl ? 'yes' : 'no'})`);
+        res.json(result);
     } catch (err) {
-        console.error('[LOOKUP] Error:', err.message);
-        if (data.profiles[key]) {
-            return res.json({ ...data.profiles[key], _fromCache: true });
-        }
-        res.status(404).json({ error: err.message });
+        console.error('[lookup] ERROR:', err);
+        res.status(500).json({ error: 'Lookup failed', detail: err.message });
     }
 });
 
-app.patch('/api/profiles/:username', (req, res) => {
-    const { username } = req.params;
-    const key = username.toLowerCase();
-    const data = loadProfiles();
-    if (!data.profiles[key]) return res.status(404).json({ error: 'Profile not found' });
-    const allowed = ['ransomDebt', 'weeksOverdue', 'kills', 'status'];
-    allowed.forEach(field => {
-        if (req.body[field] !== undefined) data.profiles[key][field] = req.body[field];
-    });
-    saveProfiles(data);
-    res.json(data.profiles[key]);
+// ─────────────────────────────────────────────────────────────
+// USER — get user info by ID
+// GET /user/1
+// ─────────────────────────────────────────────────────────────
+app.get('/user/:id', async (req, res) => {
+    const userId = req.params.id;
+    if (!userId || isNaN(parseInt(userId))) {
+        return res.status(400).json({ error: 'Valid user ID required' });
+    }
+
+    try {
+        console.log(`[user] Fetching ID: ${userId}`);
+
+        // Fetch avatar + profile in parallel
+        const [thumbRes, profileRes] = await Promise.all([
+            fetch(`https://thumbnails.roblox.com/v1/users/avatar-headshot?userIds=${userId}&size=420x420&format=Png&isCircular=false`),
+            fetch(`https://users.roblox.com/v1/users/${userId}`)
+        ]);
+
+        if (!profileRes.ok) {
+            return res.status(404).json({ error: 'User not found' });
+        }
+
+        const thumbData = thumbRes.ok ? await thumbRes.json() : null;
+        const profileData = await profileRes.json();
+
+        res.json({
+            username: profileData.name,
+            userId: profileData.id,
+            displayName: profileData.displayName || profileData.name,
+            avatarUrl: thumbData?.data?.[0]?.imageUrl || '',
+            description: profileData.description || '',
+            created: profileData.created || ''
+        });
+    } catch (err) {
+        console.error('[user] ERROR:', err);
+        res.status(500).json({ error: 'Fetch failed', detail: err.message });
+    }
 });
 
-app.delete('/api/profiles/:username', (req, res) => {
-    const { username } = req.params;
-    const key = username.toLowerCase();
-    const data = loadProfiles();
-    if (!data.profiles[key]) return res.status(404).json({ error: 'Profile not found' });
-    delete data.profiles[key];
-    saveProfiles(data);
-    res.json({ success: true });
-});
-
-app.get('*', (req, res) => {
-    res.sendFile(path.join(__dirname, 'public', 'index.html'));
-});
-
+// ─────────────────────────────────────────────────────────────
+// START SERVER
+// ─────────────────────────────────────────────────────────────
 app.listen(PORT, () => {
-    console.log(`\n  ╔═══════════════════════════════════════╗`);
-    console.log(`  ║  VCN COMMAND SERVER ONLINE            ║`);
-    console.log(`  ║  http://localhost:${PORT}                ║`);
-    console.log(`  ╚═══════════════════════════════════════╝\n`);
-    loadProfiles();
+    console.log('');
+    console.log('=================================');
+    console.log('  VCN AVATAR FETCHER ONLINE');
+    console.log('  http://localhost:' + PORT);
+    console.log('  Test: http://localhost:' + PORT + '/lookup?username=Roblox');
+    console.log('=================================');
+    console.log('');
 });
